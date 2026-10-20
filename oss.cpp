@@ -304,24 +304,198 @@ bool communicateWithWorker(int pcbIndex)
 
     Message incoming {};
 
-    while ((totalLaunched < maxProcesses || totalFinished < totalLaunched) && !terminateRequested) {
-
-        int active = activeChildren();
-
-        if (active > 0)
-            incrementClock();
-
-        long long currentTime = toTotalNano(systemClock->seconds, systemClock->nanoseconds);
-
-        if (currentTime >= nextTablePrint) {
-            printProcessTable();
-
-            while (nextTablePrint <= currentTime) {
-                nextTablePrint += TABLE_INTERVAL_NS;
-            }
+    while (msgrcv(msgId, &incoming, sizeof(Message) - sizeof(long), 1, 0) == -1) {
+        if (errno == EINTR) {
+            if (terminateRequested)
+                return false;
+            continue;
         }
 
+        perror("msgrcv");
+        return false;
+    }
+
+    logMessage("OSS: Receiving message from worker %d PID %d at time %d:%d\n", pcbIndex, static_cast<int>(incoming.pid), systemClock->seconds, systemClock->nanoseconds);
+
+    if (incoming.pid != workerPid) {
+        logMessage("OSS: Unexpected worker reply.\n");
+        return false;
+    }
+
+    if (incoming.status == 0) {
+        logMessage("OSS: Worker %d PID %d has decided to terminate.\n", pcbIndex, static_cast<int>(workerPid));
+
+        int status;
+
+        while (waitpid(workerPid, &status, 0) == -1) {
+            if (errno == EINTR) {
+                if (terminateRequested)
+                    return false;
+                continue;
+            }
+
+            if (errno != ECHILD)
+                perror("waitpid");
+
+            break;
+        }
+
+        long long startTotal = toTotalNano(processTable[pcbIndex].startSeconds, processTable[pcbIndex].startNano),
+            nendTotal = toTotalNano(systemClock->seconds, systemClock->nanoseconds);
+
+        if (endTotal >= startTotal)
+            totalRuntimeNano += endTotal - startTotal;
+
+        memset(&processTable[pcbIndex], 0, sizeof(PCB));
+        totalFinished++;
+    }
+
+    return true;
+}
+    
+
+int main(int argc, char* argv[])
+{
+    string logFileName = "oss.log";
+    int maxProcesses = 5,
+        simultaneousProcesses = 3;
+    double timeLimit = 5.0,
+        launchInterval = 0.0;
+
+    int option;
+
+    while ((option = getopt(argc, argv, "hn:s:t:i:f:")) != -1) {
+        switch (option) {
+            case 'h':
+                cout << "Usage: ./oss [-h] [-n proc] [-s simul] " << "[-t timelimit] [-i interval] [-f logfile]\n";
+                return 0;
+
+            case 'n':
+                maxProcesses = atoi(optarg);
+                break;
+
+            case 's':
+                simultaneousProcesses = atoi(optarg);
+                break;
+
+            case 't':
+                timeLimit = atof(optarg);
+                break;
+
+            case 'i':
+                launchInterval = atof(optarg);
+                break;
+
+            case 'f':
+                logFileName = optarg;
+                break;
+
+            default:
+                cerr << "Invalid arguments. Use ./oss -h for help.\n";
+                return 1;
+        }
+    }
+
+    if (maxProcesses <= 0 || simultaneousProcesses <= 0 || timeLimit < 1.0 || launchInterval < 0.0) {
+        cerr << "Invalid argument values.\n";
+        return 1;
+    }
+
+    if (simultaneousProcesses > MAX_PCB)
+        simultaneousProcesses = MAX_PCB;
+
+    maxLifetimeNano = static_cast<long long>(timeLimit * static_cast<double>(BILLION));
+
+    randomEngine.seed(static_cast<unsigned long long>(time(nullptr)) ^ static_cast<unsigned long long>(getpid()));
+
+    logFile = fopen(logFileName.c_str(), "w");
+
+    if (logFile == nullptr) {
+        perror("fopen");
+        return 1;
+    }
+
+    memset(processTable, 0, sizeof(processTable));
+
+    struct sigaction sa {};
+    sa.sa_handler = signalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, nullptr) == -1 || sigaction(SIGALRM, &sa, nullptr) == -1) {
+        perror("sigaction");
+        cleanup();
+        return 1;
+    }
+
+    alarm(60);
+
+    msgId = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
+
+    if (msgId == -1) {
+        perror("msgget");
+        cleanup();
+        return 1;
+    }
+
+    string msgIdString = to_string(msgId);
+
+    if (setenv("OSS_MSG_ID", msgIdString.c_str(), 1) == -1) {
+        perror("setenv");
+        cleanup();
+        return 1;
+    }
+
+    shmId = shmget(IPC_PRIVATE, sizeof(SharedClock), IPC_CREAT | 0600);
+
+    if (shmId == -1) {
+        perror("shmget");
+        cleanup();
+        return 1;
+    }
+
+    systemClock = static_cast<SharedClock*>(shmat(shmId, nullptr, 0));
+
+    if (systemClock == reinterpret_cast<SharedClock*>(-1)) {
+        perror("shmat");
+        systemClock = nullptr;
+        cleanup();
+        return 1;
+    }
+
+    systemClock->seconds = 0;
+    systemClock->nanoseconds = 0;
+
+    string shmIdString = to_string(shmId);
+
+    if (setenv("OSS_SHM_ID", shmIdString.c_str(), 1) == -1) {
+        perror("setenv");
+        cleanup();
+        return 1;
+    }
+
+    launchIntervalNano = static_cast<long long>(launchInterval * static_cast<double>(BILLION));
+    lastLaunchTime = -launchIntervalNano;
+
+    cout << "OSS starting, PID: " << getpid() << " PPID: " << getppid() << '\n';
+    cout << "Called with:\n"<< "-n " << maxProcesses << '\n'<< "-s " << simultaneousProcesses << '\n' << "-t " << timeLimit << '\n' << "-i " << launchInterval << '\n';
+
+    long long nextTablePrint = TABLE_INTERVAL_NS;
+
+    while ((totalLaunched < maxProcesses || totalFinished < totalLaunched) && !terminateRequested) {
+        int active = activeChildren();
+
         if (active > 0) {
+            incrementClock();
+
+            long long currentTime = toTotalNano(systemClock->seconds, systemClock->nanoseconds);
+
+            if (currentTime >= nextTablePrint) {
+                printProcessTable();
+                while (nextTablePrint <= currentTime)
+                    nextTablePrint += TABLE_INTERVAL_NS;
+            }
+
             int selected = -1;
 
             for (int i = 0; i < MAX_PCB; i++) {
@@ -334,21 +508,22 @@ bool communicateWithWorker(int pcbIndex)
                 }
             }
 
-            if (selected != -1) {
-                if (!communicateWithWorker(selected) && !terminateRequested)
-                    logMessage("OSS: Communication failed for PCB %d\n", selected);
+            if (selected != -1 &&
+                !communicateWithWorker(selected) && !terminateRequested) {
+                logMessage("OSS: Communication failed for PCB %d\n", selected);
             }
         }
 
         if (terminateRequested)
             break;
 
+        long long currentTime = toTotalNano( systemClock->seconds, systemClock->nanoseconds);
+
         active = activeChildren();
 
-        currentTime = toTotalNano(systemClock->seconds, systemClock->nanoseconds);
-
         if (totalLaunched < maxProcesses && active < simultaneousProcesses && currentTime - lastLaunchTime >= launchIntervalNano) {
-            if (launchWorker(timeLimit))
+
+            if (launchWorker())
                 lastLaunchTime = currentTime;
         }
     }
@@ -363,12 +538,12 @@ bool communicateWithWorker(int pcbIndex)
                     if (errno == EINTR)
                         continue;
 
-                    if (errno != ECHILD) 
+                    if (errno != ECHILD)
                         perror("waitpid");
 
                     break;
                 }
-
+                
                 memset(&processTable[i], 0, sizeof(PCB));
             }
         }
@@ -378,6 +553,5 @@ bool communicateWithWorker(int pcbIndex)
 
     printFinalReport();
     cleanup();
-
     return 0;
 }
