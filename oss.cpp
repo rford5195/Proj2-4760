@@ -341,7 +341,7 @@ bool communicateWithWorker(int pcbIndex)
         }
 
         long long startTotal = toTotalNano(processTable[pcbIndex].startSeconds, processTable[pcbIndex].startNano),
-            nendTotal = toTotalNano(systemClock->seconds, systemClock->nanoseconds);
+            endTotal = toTotalNano(systemClock->seconds, systemClock->nanoseconds);
 
         if (endTotal >= startTotal)
             totalRuntimeNano += endTotal - startTotal;
