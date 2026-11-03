@@ -1,3 +1,4 @@
+
 #include <iostream>
 #include <cstdlib>
 #include <cerrno>
@@ -8,24 +9,36 @@
 #include <sys/shm.h>
 #include <signal.h>
 #include <sys/msg.h>
+#include <random>
+#include <ctime>
 
 using namespace std;
 
 const long OSS_MESSAGE_TYPE = 1;
+const long long BILLION = 1000000000LL;
+
+enum {
+    TERMINATED = 0,
+    QUANTUM_USED = 1,
+    IO_BLOCKED = 2
+};
 
 struct SharedClock {
-    int seconds,
-    nanoseconds;
+    unsigned int seconds,
+        nanoseconds;
 };
 
 struct Message {
     long mtype;
     pid_t pid;
+    long long quantum,
+        used;
     int status;
 };
 
-int shmId = -1;
-int msgId = -1;
+int shmId = -1,
+    msgId = -1;
+
 SharedClock* systemClock = nullptr;
 
 volatile sig_atomic_t terminateRequested = 0;
@@ -36,36 +49,6 @@ void signalHandler(int signalNumber)
         terminateRequested = 1;
 }
 
-void normalizeTime(int& seconds, int& nanoseconds)
-{
-    while (nanoseconds >= 1'000'000'000) {
-        seconds++;
-        nanoseconds -= 1'000'000'000;
-    }
-
-    while (nanoseconds < 0) {
-        seconds--;
-        nanoseconds += 1'000'000'000;
-    }
-}
-
-int compareTime(int seconds1, int nano1, int seconds2, int nano2)
-{
-    if (seconds1 < seconds2)
-        return -1;
-
-    if (seconds1 > seconds2)
-        return 1;
-
-    if (nano1 < nano2)
-        return -1;
-
-    if (nano1 > nano2)
-        return 1;
-
-    return 0;
-}
-
 void cleanup()
 {
     if (systemClock != nullptr) {
@@ -74,31 +57,22 @@ void cleanup()
     }
 }
 
-void printWorkerStatus(int termSeconds, int termNano, const string& message)
-{
-    cout << "WORKER PID:" << getpid() << " PPID:" << getppid() << " SysClockS: " << systemClock->seconds << " SysclockNano: " << systemClock->nanoseconds << endl;
-    cout << "TermTimeS: " << termSeconds << " TermTimeNano: " << termNano << endl;
-    cout << message << endl;
-}
-
 int main(int argc, char* argv[])
 {
-    if (argc != 3) {
-        cerr << "Usage: ./worker seconds nanoseconds" << endl;
+    if (argc != 2) {
+        cerr << "Usage: ./worker totalBurstNanoseconds\n";
         return 1;
     }
 
-    int intervalSeconds = atoi(argv[1]),
-    intervalNano = atoi(argv[2]);
+    long long remainingTime = atoll(argv[1]);
 
-    if (intervalSeconds < 0 || intervalNano < 0) {
-        cerr << "Error: worker interval cannot be negative."<< endl;
+    if (remainingTime < 0) {
+        cerr << "Invalid CPU burst.\n";
         return 1;
     }
-
-    normalizeTime(intervalSeconds, intervalNano);
 
     struct sigaction sa {};
+
     sa.sa_handler = signalHandler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
@@ -111,8 +85,8 @@ int main(int argc, char* argv[])
     const char* shmEnvironment = getenv("OSS_SHM_ID");
     const char* msgEnvironment = getenv("OSS_MSG_ID");
 
-    if (shmEnvironment == nullptr || msgEnvironment == nullptr) {
-        cerr << "Error: OSS_SHM_ID or OSS_MSG_ID was not set." << endl;
+    if (!shmEnvironment || !msgEnvironment) {
+        cerr << "OSS shared memory or message queue ID missing.\n";
         return 1;
     }
 
@@ -127,25 +101,20 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    int startSeconds = systemClock->seconds,
-        startNano = systemClock->nanoseconds,
-        termSeconds = startSeconds + intervalSeconds,
-        termNano = startNano + intervalNano;
+    mt19937_64 randomEngine(static_cast<unsigned long long>(getpid()) ^ static_cast<unsigned long long>(time(nullptr)));
 
-    normalizeTime(termSeconds, termNano);
+    uniform_int_distribution<int> ioChance(1, 100);
 
-    printWorkerStatus(termSeconds,termNano,"--Just Starting");
+    cout << "WORKER PID:" << getpid() << " PPID:" << getppid() << " Starting CPU burst: " << remainingTime << " nanoseconds\n";
 
-    int messagesReceived = 0;
-    bool done = false;
-
-    while (!done && !terminateRequested) {
+    while (!terminateRequested) {
         Message incoming {};
 
-        while (msgrcv( msgId, &incoming, sizeof(Message) - sizeof(long), static_cast<long>(getpid()), 0) == -1) {
+        while (msgrcv(msgId, &incoming, sizeof(Message) - sizeof(long), static_cast<long>(getpid()), 0) == -1) {
             if (errno == EINTR) {
                 if (terminateRequested)
                     break;
+
                 continue;
             }
 
@@ -162,37 +131,47 @@ int main(int argc, char* argv[])
         if (terminateRequested)
             break;
 
-        messagesReceived++;
+        long long quantum = incoming.quantum;
 
-        int currentSeconds = systemClock->seconds,
-            currentNano = systemClock->nanoseconds;
-
-        bool timeExpired = compareTime(currentSeconds, currentNano, termSeconds, termNano) >= 0;
+        if (quantum <= 0)
+            continue;
 
         Message outgoing {};
+
         outgoing.mtype = OSS_MESSAGE_TYPE;
         outgoing.pid = getpid();
-        outgoing.status = timeExpired ? 0 : 1;
 
-        if (timeExpired) {
-            printWorkerStatus(termSeconds, termNano, "--Terminating after sending message back to OSS after " + to_string(messagesReceived) + " received messages.");
-            done = true;
-        } 
+        if (remainingTime <= quantum) {
+            outgoing.used = remainingTime;
+            outgoing.status = TERMINATED;
+            cout << "WORKER PID:" << getpid() << " Terminating after using " << outgoing.used << " nanoseconds\n";
+            remainingTime = 0;
+        }
         else {
-            string messageText;
-            
-            if (messagesReceived == 1)
-                messageText = "--1 message received from OSS";
-            else 
-                messageText = "--" + to_string(messagesReceived) + " messages received from OSS";
+            int chance = ioChance(randomEngine);
 
-            printWorkerStatus(termSeconds, termNano, messageText);
+            if (chance <= 20) {
+                uniform_int_distribution<long long> ioTime(1, quantum - 1);
+                outgoing.used = ioTime(randomEngine);
+                outgoing.status = IO_BLOCKED;
+
+                cout << "WORKER PID:" << getpid() << " Becoming blocked after using " << outgoing.used << " nanoseconds\n";
+            }
+            else {
+                outgoing.used = quantum;
+                outgoing.status = QUANTUM_USED;
+                cout << "WORKER PID:" << getpid() << " Used full quantum of " << quantum << " nanoseconds\n";
+            }
         }
 
+        remainingTime -= outgoing.used;
+
         while (msgsnd(msgId, &outgoing, sizeof(Message) - sizeof(long), 0) == -1) {
+
             if (errno == EINTR) {
                 if (terminateRequested)
                     break;
+
                 continue;
             }
 
@@ -205,8 +184,12 @@ int main(int argc, char* argv[])
             terminateRequested = 1;
             break;
         }
+
+        if (outgoing.status == TERMINATED)
+            break;
     }
 
     cleanup();
+
     return 0;
 }
