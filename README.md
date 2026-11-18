@@ -1,5 +1,5 @@
 Name: Robert Ford
-Date: Oct 31, 2026
+Date: November 15, 2026
 Environment: Visual Studio, Linux, git
 How to compile the project:
 Type ’make’
@@ -16,14 +16,19 @@ Prompt:
   I keep getting an error about the libraries
 
   How do I change my project to ask for a .log file instead of txt
+
+  Can you cleanup my global variable initialization
+  How should I update my makefile
 Summary: Asked for the general start of project and how to make the makefile
 
   Asked how to modify worker to better reflect new proj2 and see why the new libraries were giving errors.
 
   Asked how to change the project to better reflect the use of a log file.
+
+  Asked for my start of my global variables to be easier to read and how the makefile should be updated to reflect new contents
 Updates from last Submission: 
 Updated the project to reflect changes of project
 Included but not limited to:
 Have message send to a json file
-Remove checking for children
 New worker initialization
+new header file
