@@ -1,4 +1,3 @@
-
 #include <iostream>
 #include <iomanip>
 #include <string>
@@ -16,89 +15,67 @@
 #include <cstdarg>
 #include <random>
 #include <ctime>
-#include <cmath>
 #include <deque>
 #include <algorithm>
 
+#include "resource.h"
+
 using namespace std;
 
-const int MAX_PCB = 18;
-const long long BILLION = 1000000000LL,
-    TABLE_INTERVAL_NS = 500000000LL,
-    SCHEDULING_COST = 1000LL,
-    IO_BLOCK_TIME = 200000000LL;
-
-const long long QUANTA[3] = {25000000LL, 50000000LL, 100000000LL};
-
-enum {
-    TERMINATED = 0,
-    QUANTUM_USED = 1,
-    IO_BLOCKED = 2
-};
-
-struct SharedClock {
-    unsigned int seconds,
-        nanoseconds;
-};
-
-struct PCB {
-    int occupied;
-    pid_t pid;
-    int localPid;
-
-    int startSeconds,
-        startNano;
-
-    long long serviceTime;
-
-    int eventWaitSec,
-        eventWaitNano,
-        blocked,
-        queueLevel;
-};
-
-struct Message {
-    long mtype;
-    pid_t pid;
-    long long quantum,
-        used;
-    int status;
-};
+const long long TABLE_INTERVAL = 500000000LL,
+    DEADLOCK_INTERVAL = 1000000000LL,
+    CLOCK_INCREMENT = 10000000LL;
 
 int shmId = -1,
     msgId = -1;
 
 SharedClock* systemClock = nullptr;
 
-PCB processTable[MAX_PCB];
+PCB processTable[MAX_PCB]{};
+Resource resourceTable[RESOURCE_TYPES]{};
 
-deque<int> readyQueues[3];
+deque<int> readyQueue;
+
 FILE* logFile = nullptr;
-mt19937_64 randomEngine;
-volatile sig_atomic_t terminateRequested = 0;
-
-int totalLaunched = 0,
-    totalFinished = 0,
-    nextLocalPid = 1;
-
 int logLines = 0;
 bool logLimitReached = false;
 
-long long totalCpuTime = 0,
-    totalNonCpuTime = 0,
-    totalIoBlocks = 0,
-    nextLaunchTime = 0,
-    nextTablePrint = TABLE_INTERVAL_NS,
-    maxLifetimeNano = 2500000000LL,
-    launchIntervalNano = 0;
+mt19937_64 randomEngine;
 
-int maxProcesses = 5,
+volatile sig_atomic_t terminateRequested = 0,
+    stopLaunching = 0;
+
+int totalLaunched = 0,
+    totalFinished = 0,
+    nextLocalPid = 0,
+    totalRequests = 0,
+    immediateGrants = 0,
+    grantedSinceTable = 0,
+    deadlockChecks = 0,
+    deadlockTerminations = 0,
+    maxProcesses = 5,
     simultaneousProcesses = 3;
+
+double timeLimit = 2.5,
+    launchInterval = 0.0;
+
+long long maxLifetimeNano = 2500000000LL,
+    launchIntervalNano = 0,
+    nextLaunchTime = 0,
+    nextTablePrint = TABLE_INTERVAL,
+    nextDeadlockCheck = DEADLOCK_INTERVAL;
+
+void printProcessTable();
+void grantWaitingProcesses();
+void releaseProcess(int index, bool notify);
 
 void signalHandler(int signalNumber)
 {
-    if (signalNumber == SIGINT || signalNumber == SIGALRM)
+    if (signalNumber == SIGINT || signalNumber == SIGTERM)
         terminateRequested = 1;
+
+    if (signalNumber == SIGALRM)
+        stopLaunching = 1;
 }
 
 long long clockToNano()
@@ -106,45 +83,21 @@ long long clockToNano()
     return static_cast<long long>(systemClock->seconds) * BILLION + systemClock->nanoseconds;
 }
 
-void normalizeClock()
-{
-    while (systemClock->nanoseconds >= BILLION) {
-        systemClock->seconds++;
-        systemClock->nanoseconds -= BILLION;
-    }
-}
-
-void advanceClock(long long amount, bool cpuTime)
+void advanceClock(long long amount)
 {
     if (amount <= 0)
         return;
 
-    systemClock->nanoseconds += static_cast<unsigned int>(amount);
-    normalizeClock();
+    long long total = clockToNano() + amount;
 
-    if (cpuTime)
-        totalCpuTime += amount;
-    else
-        totalNonCpuTime += amount;
-}
-
-void addTime(long long amount, int& seconds, int& nano)
-{
-    long long result = static_cast<long long>(seconds) * BILLION + nano + amount;
-    seconds = static_cast<int>(result / BILLION);
-    nano = static_cast<int>(result % BILLION);
-}
-
-long long toTotalNano(int seconds, int nano)
-{
-    return static_cast<long long>(seconds) * BILLION + nano;
+    systemClock->seconds = static_cast<unsigned int>(total / BILLION);
+    systemClock->nanoseconds = static_cast<unsigned int>(total % BILLION);
 }
 
 void logMessage(const char* format, ...)
 {
     va_list args;
     va_start(args, format);
-
     va_list screenArgs;
     va_copy(screenArgs, args);
 
@@ -154,43 +107,44 @@ void logMessage(const char* format, ...)
     va_end(screenArgs);
 
     if (logFile != nullptr && !logLimitReached) {
+
+        char buffer[8192];
+
         va_list fileArgs;
         va_copy(fileArgs, args);
-
-        char buffer[4096];
 
         int count = vsnprintf(buffer, sizeof(buffer), format, fileArgs);
 
         va_end(fileArgs);
 
         if (count > 0) {
-            for (int i = 0; i < count && i < (int)sizeof(buffer); i++) {
-                if (buffer[i] == '\n')
+            int length = min(count, static_cast<int>(sizeof(buffer)) - 1),
+                allowed = 0;
+
+            for (int i = 0; i < length; i++) {
+                if (buffer[i] == '\n') {
+                    if (logLines >= 10000) {
+                        logLimitReached = true;
+                        break;
+                    }
+
                     logLines++;
+                }
+
+                allowed++;
             }
 
-            if (logLines <= 10000)
-                fputs(buffer, logFile);
-            else {
+            if (allowed > 0) {
+                fwrite(buffer, 1, allowed, logFile);
+                fflush(logFile);
+            }
+
+            if (logLines >= 10000)
                 logLimitReached = true;
-                fprintf(stdout, "OSS: Log file reached 10000 lines.\n");
-            }
-
-            fflush(logFile);
         }
     }
 
     va_end(args);
-}
-
-int findFreePCB()
-{
-    for (int i = 0; i < MAX_PCB; i++) {
-        if (!processTable[i].occupied)
-            return i;
-    }
-
-    return -1;
 }
 
 int activeChildren()
@@ -205,116 +159,256 @@ int activeChildren()
     return count;
 }
 
-void printQueues()
+int findFreePCB()
 {
-    logMessage("OSS: ");
-
-    for (int q = 0; q < 3; q++) {
-        logMessage("q%d[", q);
-
-        for (size_t i = 0; i < readyQueues[q].size(); i++) {
-            logMessage("%d", processTable[readyQueues[q][i]].localPid);
-
-            if (i + 1 < readyQueues[q].size())
-                logMessage(",");
-        }
-
-        logMessage("]");
-    }
-
-    logMessage(",blocked[");
-
-    bool first = true;
-
     for (int i = 0; i < MAX_PCB; i++) {
-        if (processTable[i].occupied && processTable[i].blocked) {
-            if (!first)
-                logMessage(",");
-
-            logMessage("%d", processTable[i].localPid);
-            first = false;
-        }
+        if (!processTable[i].occupied)
+            return i;
     }
 
-    logMessage("]\n");
+    return -1;
 }
 
-void printProcessTable()
+void removeFromReadyQueue(int index)
 {
-    logMessage("\nOSS PID:%d SysClockS:%u SysClockNano:%u\n", static_cast<int>(getpid()), systemClock->seconds, systemClock->nanoseconds);
-    logMessage("%-6s %-9s %-9s %-9s %-12s %-12s %-12s %-9s\n", "Entry", "Occupied", "PID", "LocalPID", "StartS", "StartN", "ServiceNS", "Queue");
+    readyQueue.erase(remove(readyQueue.begin(), readyQueue.end(), index), readyQueue.end());
+    processTable[index].inReadyQueue = 0;
+}
 
+void enqueueProcess(int index)
+{
+    PCB& pcb = processTable[index];
+
+    if (!pcb.occupied || pcb.blocked || pcb.inReadyQueue)
+        return;
+
+    readyQueue.push_back(index);
+    pcb.inReadyQueue = 1;
+}
+
+int selectProcess()
+{
+    while (!readyQueue.empty()) {
+
+        int index = readyQueue.front();
+        readyQueue.pop_front();
+
+        if (index < 0 || index >= MAX_PCB)
+            continue;
+
+        PCB& pcb = processTable[index];
+
+        pcb.inReadyQueue = 0;
+
+        if (!pcb.occupied || pcb.blocked)
+            continue;
+
+        return index;
+    }
+
+    return -1;
+}
+
+bool sendCommand(int index, int command, int resource = -1)
+{
+    if (index < 0 || index >= MAX_PCB)
+        return false;
+
+    if (!processTable[index].occupied)
+        return false;
+
+    Message outgoing{};
+
+    outgoing.mtype = processTable[index].pid;
+    outgoing.pid = processTable[index].pid;
+    outgoing.command = command;
+    outgoing.resourceAction = resource;
+
+    if (msgsnd(msgId, &outgoing, sizeof(Message) - sizeof(long), 0) == -1)
+    {
+        if (errno != EIDRM && errno != EINVAL)
+            perror("OSS msgsnd");
+
+        return false;
+    }
+
+    return true;
+}
+
+// Returns:  1 = message received
+//           0 = abort (termination requested or queue removed / error)
+//          -1 = the worker exited without sending a message (not yet reaped)
+int receiveAction(Message& incoming, pid_t workerPid)
+{
+    while (true) {
+
+        if (msgrcv(msgId, &incoming, sizeof(Message) - sizeof(long), OSS_MESSAGE_TYPE, IPC_NOWAIT) != -1)
+            return 1;
+
+        if (errno == EINTR) {
+            if (terminateRequested)
+                return 0;
+
+            continue;
+        }
+
+        if (errno == EIDRM || errno == EINVAL)
+            return 0;
+
+        if (errno != ENOMSG) {
+            perror("OSS msgrcv");
+            return 0;
+        }
+
+        if (terminateRequested)
+            return 0;
+
+        // No message yet: peek (without reaping) to see whether the worker has already exited.
+        siginfo_t info{};
+
+        if (waitid(P_PID, static_cast<id_t>(workerPid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid != 0) {
+
+            // The worker may have sent its message right before exiting, so check once more.
+            if (msgrcv(msgId, &incoming, sizeof(Message) - sizeof(long), OSS_MESSAGE_TYPE, IPC_NOWAIT) != -1)
+                return 1;
+
+            return -1;
+        }
+
+        usleep(100);
+    }
+}
+
+void initializeResources()
+{
+    for (int i = 0; i < RESOURCE_TYPES; i++) {
+        resourceTable[i].total = RESOURCE_INSTANCES;
+        resourceTable[i].available = RESOURCE_INSTANCES;
+
+        for (int j = 0; j < MAX_PCB; j++)
+            resourceTable[i].allocated[j] = 0;
+    }
+}
+
+void removeProcessResources(int index)
+{
+    PCB& pcb = processTable[index];
+    string released;
+
+    for (int r = 0; r < RESOURCE_TYPES; r++)
+    {
+        int amount = pcb.resourcesAllocated[r];
+
+        if (amount > 0)
+        {
+            resourceTable[r].available += amount;
+            resourceTable[r].allocated[index] = 0;
+            pcb.resourcesAllocated[r] = 0;
+
+            if (!released.empty())
+                released += ", ";
+
+            released += "R" + to_string(r) + ":" + to_string(amount);
+        }
+    }
+
+    logMessage("Resources released are as follows: %s\n", released.empty() ? "None" : released.c_str());
+}
+
+void grantWaitingProcesses()
+{
     for (int i = 0; i < MAX_PCB; i++)
-        logMessage("%-6d %-9d %-9d %-9d %-12d %-12d %-12lld %-9d\n", i, processTable[i].occupied, static_cast<int>(processTable[i].pid), processTable[i].localPid, processTable[i].startSeconds, processTable[i].startNano, processTable[i].serviceTime, processTable[i].queueLevel);
+    {
+        PCB& pcb = processTable[i];
 
-    printQueues();
-    logMessage("\n");
-}
+        if (!pcb.occupied || !pcb.blocked)
+            continue;
 
-void cleanup()
-{
-    if (systemClock != nullptr) {
-        shmdt(systemClock);
-        systemClock = nullptr;
-    }
+        int resource = pcb.requestedResource;
 
-    if (shmId != -1) {
-        shmctl(shmId, IPC_RMID, nullptr);
-        shmId = -1;
-    }
+        if (resource < 0 || resource >= RESOURCE_TYPES)
+            continue;
 
-    if (msgId != -1) {
-        msgctl(msgId, IPC_RMID, nullptr);
-        msgId = -1;
-    }
+        if (resourceTable[resource].available <= 0)
+            continue;
 
-    if (logFile != nullptr) {
-        fclose(logFile);
-        logFile = nullptr;
-    }
-}
+        resourceTable[resource].available--;
+        resourceTable[resource].allocated[i]++;
+        pcb.resourcesAllocated[resource]++;
+        pcb.blocked = 0;
+        pcb.requestedResource = -1;
 
-void killChildren()
-{
-    for (int i = 0; i < MAX_PCB; i++) {
-        if (processTable[i].occupied && processTable[i].pid > 0)
-            kill(processTable[i].pid, SIGTERM);
-    }
+        logMessage("OSS: Granting previously blocked request R%d to P%d at time %u:%u\n", resource, pcb.localPid, systemClock->seconds, systemClock->nanoseconds);
 
-    for (int i = 0; i < MAX_PCB; i++) {
-        if (processTable[i].occupied && processTable[i].pid > 0) {
-            while (waitpid(processTable[i].pid, nullptr, 0) == -1) {
-                if (errno == EINTR)
-                    continue;
-
-                break;
-            }
-
-            memset(&processTable[i], 0, sizeof(PCB));
+        if (!sendCommand(i, GRANT, resource))
+        {
+            logMessage("OSS: Could not notify P%d of its grant.\n", pcb.localPid);
+            resourceTable[resource].available++;
+            resourceTable[resource].allocated[i]--;
+            pcb.resourcesAllocated[resource]--;
+            pcb.blocked = 1;
+            pcb.requestedResource = resource;
+            continue;
         }
+
+        grantedSinceTable++;
+
+        if (grantedSinceTable >= 20)
+        {
+            printProcessTable();
+            grantedSinceTable = 0;
+        }
+
+        enqueueProcess(i);
     }
 }
 
-void printFinalReport()
+void releaseProcess(int index, bool notify)
 {
-    long long totalTime = clockToNano();
+    if (index < 0 || index >= MAX_PCB)
+        return;
 
-    double utilization = 0.0;
+    if (!processTable[index].occupied)
+        return;
 
-    if (totalTime > 0)
-        utilization = (static_cast<double>(totalCpuTime) / static_cast<double>(totalTime)) * 100.0;
+    PCB& pcb = processTable[index];
 
-    logMessage("\n========================================\n");
-    logMessage("OSS FINAL REPORT\n");
-    logMessage("========================================\n");
-    logMessage("Total processes launched: %d\n", totalLaunched);
-    logMessage("Total processes finished: %d\n", totalFinished);
-    logMessage("Total CPU time: %lld nanoseconds\n", totalCpuTime);
-    logMessage("Total non-CPU time: %lld nanoseconds\n", totalNonCpuTime);
-    logMessage("Total I/O blocks: %lld\n", totalIoBlocks);
-    logMessage("Total simulated time: %lld seconds %lld nanoseconds\n", totalTime / BILLION,  totalTime % BILLION);
-    logMessage("CPU utilization: %.2f%%\n", utilization);
-    logMessage("========================================\n");
+    pid_t pid = pcb.pid;
+    int localPid = pcb.localPid;
+
+    removeFromReadyQueue(index);
+
+    if (notify)
+    {
+        if (!sendCommand(index, TERMINATE))
+            kill(pid, SIGTERM);
+    }
+
+    removeProcessResources(index);
+
+    pcb.blocked = 0;
+    pcb.requestedResource = -1;
+
+    int status;
+
+    while (waitpid(pid, &status, 0) == -1)
+    {
+        if (errno == EINTR)
+            continue;
+
+        if (errno != ECHILD)
+            perror("OSS waitpid");
+
+        break;
+    }
+
+    logMessage("OSS: Process P%d (PID %d) has terminated.\n", localPid, static_cast<int>(pid));
+
+    memset(&pcb, 0, sizeof(PCB));
+
+    totalFinished++;
+
+    grantWaitingProcesses();
 }
 
 bool launchWorker()
@@ -324,24 +418,31 @@ bool launchWorker()
     if (index == -1)
         return false;
 
-    uniform_int_distribution<long long> burstDistribution(1, maxLifetimeNano > 0 ? maxLifetimeNano : 1);
+    long long lifetime = 0;
 
-    long long burstTime = burstDistribution(randomEngine);
+    if (maxLifetimeNano > 0)
+    {
+        uniform_int_distribution<long long> distribution(1, maxLifetimeNano);
+        lifetime = distribution(randomEngine);
+    }
 
-    int startSeconds = systemClock->seconds,
+    unsigned int startSeconds = systemClock->seconds,
         startNano = systemClock->nanoseconds;
 
     pid_t pid = fork();
 
-    if (pid < 0) {
+    if (pid == -1) {
         perror("fork");
         return false;
     }
 
     if (pid == 0) {
-        string burstString = to_string(burstTime);
 
-        execl("./worker", "./worker", burstString.c_str(), nullptr);
+        string lifetimeString = to_string(lifetime),
+            secondsString = to_string(startSeconds),
+            nanoString = to_string(startNano);
+
+        execl("./worker", "./worker", lifetimeString.c_str(), secondsString.c_str(), nanoString.c_str(), nullptr);
         perror("execl");
         _exit(EXIT_FAILURE);
     }
@@ -353,209 +454,469 @@ bool launchWorker()
     pcb.occupied = 1;
     pcb.pid = pid;
     pcb.localPid = nextLocalPid++;
-
     pcb.startSeconds = startSeconds;
     pcb.startNano = startNano;
-
-    pcb.serviceTime = 0;
-    pcb.queueLevel = 0;
+    pcb.lifetimeNano = lifetime;
     pcb.blocked = 0;
+    pcb.requestedResource = -1;
+    pcb.inReadyQueue = 0;
 
-    readyQueues[0].push_back(index);
+    enqueueProcess(index);
+
     totalLaunched++;
-    logMessage("OSS: Generating process with PID %d (simulated PID %d), burst %lld ns and putting it in q0 at time %d:%d\n", static_cast<int>(pid), pcb.localPid, burstTime, startSeconds, startNano);
+
+    logMessage("OSS: Generating P%d with PID %d, lifetime %lld ns at time %u:%u\n", pcb.localPid, static_cast<int>(pid), lifetime, startSeconds, startNano);
     return true;
 }
 
-void checkBlockedProcesses()
-{
-    long long currentTime = clockToNano();
-
-    for (int i = 0; i < MAX_PCB; i++) {
-        PCB& pcb = processTable[i];
-
-        if (!pcb.occupied || !pcb.blocked)
-            continue;
-
-        long long eventTime = toTotalNano(pcb.eventWaitSec, pcb.eventWaitNano);
-
-        if (currentTime >= eventTime) {
-            pcb.blocked = 0;
-            pcb.queueLevel = 0;
-
-            advanceClock(SCHEDULING_COST, false);
-            readyQueues[0].push_back(i);
-            logMessage("OSS: Process %d has unblocked and returned to q0 at time %u:%u\n", pcb.localPid, systemClock->seconds, systemClock->nanoseconds);
-        }
-    }
-}
-
-int selectProcess()
-{
-    for (int q = 0; q < 3; q++) {
-        if (!readyQueues[q].empty()) {
-            int index = readyQueues[q].front();
-            readyQueues[q].pop_front();
-            return index;
-        }
-    }
-
-    return -1;
-}
-
-void updateProcessTableTiming()
-{
-    long long currentTime = clockToNano();
-
-    if (currentTime >= nextTablePrint) {
-        printProcessTable();
-
-        while (nextTablePrint <= currentTime)
-            nextTablePrint += TABLE_INTERVAL_NS;
-    }
-}
-
-void advanceIdleClock()
-{
-    long long currentTime = clockToNano(),
-        nextEvent = -1;
-
-    if (totalLaunched < maxProcesses && activeChildren() < simultaneousProcesses)
-        nextEvent = nextLaunchTime;
-
-    for (int i = 0; i < MAX_PCB; i++) {
-        if (processTable[i].occupied && processTable[i].blocked) {
-            long long eventTime = toTotalNano(processTable[i].eventWaitSec, processTable[i].eventWaitNano);
-
-            if (nextEvent == -1 || eventTime < nextEvent)
-                nextEvent = eventTime;
-        }
-    }
-
-    if (nextEvent > currentTime) {
-        long long difference = nextEvent - currentTime;
-        advanceClock(difference, false);
-    }
-    else
-        advanceClock(SCHEDULING_COST, false);
-}
-
-bool dispatchProcess(int index)
+void processRequest(int index, int resource)
 {
     PCB& pcb = processTable[index];
 
-    int queue = pcb.queueLevel;
-    long long quantum = QUANTA[queue];
+    totalRequests++;
 
-    advanceClock(SCHEDULING_COST, false);
-    logMessage("OSS: Dispatching process PID %d from q%d at time %u:%u\n", pcb.localPid, queue, systemClock->seconds, systemClock->nanoseconds);
+    logMessage("OSS has detected Process P%d requesting R%d at time %u:%u\n", pcb.localPid, resource, systemClock->seconds, systemClock->nanoseconds);
 
-    Message outgoing {};
+    if (resourceTable[resource].available > 0)
+    {
+        resourceTable[resource].available--;
+        resourceTable[resource].allocated[index]++;
+        pcb.resourcesAllocated[resource]++;
 
-    outgoing.mtype = pcb.pid;
-    outgoing.pid = pcb.pid;
-    outgoing.quantum = quantum;
+        logMessage("OSS granting P%d request R%d at time %u:%u\n", pcb.localPid, resource, systemClock->seconds, systemClock->nanoseconds);
 
-    if (msgsnd(msgId, &outgoing, sizeof(Message) - sizeof(long), 0) == -1) {
-        if (errno != EINTR)
-            perror("OSS msgsnd");
+        if (!sendCommand(index, GRANT, resource))
+        {
+            logMessage("OSS: Could not notify P%d of its grant.\n", pcb.localPid);
 
-        return false;
-    }
-
-    Message incoming {};
-
-    while (msgrcv(msgId, &incoming, sizeof(Message) - sizeof(long), 1, 0) == -1) {
-        if (errno == EINTR) {
-            if (terminateRequested)
-                return false;
-
-            continue;
+            // Undo the grant; leave the process blocked on this resource.
+            resourceTable[resource].available++;
+            resourceTable[resource].allocated[index]--;
+            pcb.resourcesAllocated[resource]--;
+            pcb.blocked = 1;
+            pcb.requestedResource = resource;
+            return;
         }
 
-        if (errno == EIDRM || errno == EINVAL)
-            return false;
+        immediateGrants++;
+        enqueueProcess(index);
 
-        perror("OSS msgrcv");
-        return false;
+        grantedSinceTable++;
+
+        if (grantedSinceTable >= 20)
+        {
+            printProcessTable();
+            grantedSinceTable = 0;
+        }
+    }
+    else {
+
+        pcb.blocked = 1;
+        pcb.requestedResource = resource;
+
+        logMessage("OSS: P%d cannot obtain R%d and is now blocked at time %u:%u\n", pcb.localPid, resource, systemClock->seconds, systemClock->nanoseconds);
+    }
+}
+
+void processRelease(int index, int resource)
+{
+    PCB& pcb = processTable[index];
+
+    if (pcb.resourcesAllocated[resource] <= 0)
+    {
+        logMessage("OSS: P%d attempted to release unallocated R%d.\n", pcb.localPid, resource);
+        enqueueProcess(index);
+        return;
+    }
+
+    pcb.resourcesAllocated[resource]--;
+    resourceTable[resource].allocated[index]--;
+    resourceTable[resource].available++;
+
+    logMessage("OSS has acknowledged Process P%d releasing R%d at time %u:%u\n", pcb.localPid, resource, systemClock->seconds, systemClock->nanoseconds);
+    enqueueProcess(index);
+    grantWaitingProcesses();
+}
+
+void finishProcess(int index)
+{
+    PCB& pcb = processTable[index];
+
+    pid_t pid = pcb.pid;
+
+    removeFromReadyQueue(index);
+    removeProcessResources(index);
+
+    while (waitpid(pid, nullptr, 0) == -1)
+    {
+        if (errno == EINTR)
+            continue;
+
+        if (errno != ECHILD)
+            perror("OSS waitpid");
+
+        break;
+    }
+
+    memset(&pcb, 0, sizeof(PCB));
+
+    totalFinished++;
+    grantWaitingProcesses();
+}
+
+void dispatchProcess(int index)
+{
+    PCB& pcb = processTable[index];
+
+    if (!pcb.occupied || pcb.blocked)
+        return;
+
+    if (!sendCommand(index, DISPATCH))
+        return;
+
+    Message incoming{};
+
+    int result = receiveAction(incoming, pcb.pid);
+
+    if (result == 0)
+        return;
+
+    if (result == -1) {
+
+        logMessage("OSS: P%d exited unexpectedly. Cleaning up.\n", pcb.localPid);
+        finishProcess(index);
+        return;
     }
 
     if (incoming.pid != pcb.pid) {
-        logMessage("OSS: ERROR - Unexpected worker response.\n");
+
+        logMessage("OSS: Unexpected response. Expected PID %d, received PID %d.\n", static_cast<int>(pcb.pid), static_cast<int>(incoming.pid));
+        enqueueProcess(index);
+        return;
+    }
+
+    if (incoming.resourceAction == 0)
+    {
+        logMessage("OSS: P%d has finished and is terminating.\n", pcb.localPid);
+        finishProcess(index);
+        return;
+    }
+
+    if (incoming.resourceAction > 0 && incoming.resourceAction <= RESOURCE_TYPES)
+    {
+        int resource = incoming.resourceAction - 1;
+        processRequest(index, resource);
+        return;
+    }
+
+    if (incoming.resourceAction < 0 && incoming.resourceAction >= -RESOURCE_TYPES)
+    {
+        int resource = -incoming.resourceAction - 1;
+        processRelease(index, resource);
+        return;
+    }
+
+    logMessage("OSS: Invalid resource action from P%d.\n", pcb.localPid);
+    enqueueProcess(index);
+}
+
+void printProcessTable()
+{
+    logMessage("\n");
+    logMessage("============================================================\n");
+    logMessage("OSS Process Table at %u:%u\n", systemClock->seconds, systemClock->nanoseconds);
+    logMessage("============================================================\n");
+    logMessage("%-8s %-10s %-10s %-10s %-12s\n", "Entry", "PID", "LocalPID", "Blocked", "Requested");
+
+    for (int i = 0; i < MAX_PCB; i++)
+    {
+        PCB& pcb = processTable[i];
+
+        if (!pcb.occupied)
+            continue;
+
+        string requested = "-";
+
+        if (pcb.blocked)
+            requested = "R" + to_string(pcb.requestedResource);
+
+        logMessage("%-8d %-10d %-10d %-10d %-12s\n", i, static_cast<int>(pcb.pid), pcb.localPid, pcb.blocked, requested.c_str());
+    }
+
+    logMessage("\nBlocked Processes:\n");
+    bool foundBlocked = false;
+
+    for (int i = 0; i < MAX_PCB; i++) {
+
+        PCB& pcb = processTable[i];
+
+        if (pcb.occupied && pcb.blocked)
+        {
+            logMessage("P%d: Waiting on R%d\n", pcb.localPid, pcb.requestedResource);
+            foundBlocked = true;
+        }
+    }
+
+    if (!foundBlocked)
+        logMessage("None\n");
+
+    logMessage("\nCurrent System Resources:\n");
+    logMessage("%-12s %-10s %-12s\n", "Resource", "Total", "Available");
+
+    for (int r = 0; r < RESOURCE_TYPES; r++)
+        logMessage("R%-11d %-10d %-12d\n", r, resourceTable[r].total, resourceTable[r].available);
+
+    logMessage("\nResources Allocated:\n");
+    logMessage("%-10s", "Process");
+
+    for (int r = 0; r < RESOURCE_TYPES; r++)
+    {
+        string resourceName = "R" + to_string(r);
+        logMessage("%-7s", resourceName.c_str());
+    }
+
+    logMessage("\n");
+
+    for (int i = 0; i < MAX_PCB; i++)
+    {
+        PCB& pcb = processTable[i];
+
+        if (!pcb.occupied)
+            continue;
+
+        string processName = "P" + to_string(pcb.localPid);
+        logMessage("%-10s", processName.c_str());
+
+        for (int r = 0; r < RESOURCE_TYPES; r++)
+            logMessage("%-7d", pcb.resourcesAllocated[r]);
+
+        logMessage("\n");
+    }
+
+    logMessage("============================================================\n\n");
+}
+
+// Returns true if a deadlock was found and a victim was terminated.
+bool detectDeadlock()
+{
+    deadlockChecks++;
+
+    logMessage("\nOSS running deadlock detection at time %u:%u\n", systemClock->seconds, systemClock->nanoseconds);
+
+    int work[RESOURCE_TYPES];
+    bool finish[MAX_PCB] = {false};
+
+    for (int r = 0; r < RESOURCE_TYPES; r++)
+        work[r] = resourceTable[r].available;
+
+    for (int i = 0; i < MAX_PCB; i++)
+    {
+        if (!processTable[i].occupied)
+        {
+            finish[i] = true;
+            continue;
+        }
+
+        int allocatedCount = 0;
+
+        for (int r = 0; r < RESOURCE_TYPES; r++)
+            allocatedCount += processTable[i].resourcesAllocated[r];
+
+        finish[i] = (allocatedCount == 0);
+    }
+
+    bool progress = true;
+
+    while (progress)
+    {
+        progress = false;
+
+        for (int i = 0; i < MAX_PCB; i++)
+        {
+            PCB& pcb = processTable[i];
+
+            if (!pcb.occupied || finish[i])
+                continue;
+
+            int request = pcb.blocked ? pcb.requestedResource : -1;
+            bool canFinish = false;
+
+            if (request == -1)
+                canFinish = true;
+            else if (request >= 0 && request < RESOURCE_TYPES)
+            {
+                if (work[request] >= 1)
+                    canFinish = true;
+            }
+
+            if (!canFinish)
+                continue;
+
+            for (int r = 0; r < RESOURCE_TYPES; r++)
+                work[r] += pcb.resourcesAllocated[r];
+
+            finish[i] = true;
+            progress = true;
+        }
+    }
+
+    int victim = -1;
+    string involved;
+
+    for (int i = 0; i < MAX_PCB; i++)
+    {
+        if (!processTable[i].occupied || finish[i])
+            continue;
+
+        if (!involved.empty())
+            involved += ", ";
+
+        involved += "P" + to_string(processTable[i].localPid);
+
+        if (victim == -1 || processTable[i].localPid < processTable[victim].localPid)
+            victim = i;
+    }
+
+    if (victim == -1)
+    {
+        logMessage("No deadlock detected.\n\n");
         return false;
     }
 
-    long long used = incoming.used;
+    logMessage("Processes %s deadlocked\n", involved.c_str());
+    logMessage("Attempting to resolve deadlock...\n");
+    logMessage("Killing process P%d:\n", processTable[victim].localPid);
 
-    if (used < 0)
-        used = 0;
+    deadlockTerminations++;
+    releaseProcess(victim, true);
 
-    if (used > quantum)
-        used = quantum;
+    return true;
+}
 
-    advanceClock(used, true);
-    pcb.serviceTime += used;
-    logMessage("OSS: Receiving that process PID %d ran for %lld nanoseconds\n", pcb.localPid, used);
+void updatePeriodicEvents()
+{
+    long long currentTime = clockToNano();
 
-    if (incoming.status == TERMINATED) {
-        logMessage("OSS: Process %d terminated after using %lld ns\n", pcb.localPid, pcb.serviceTime);
-        int status;
+    if (currentTime >= nextTablePrint)
+    {
+        printProcessTable();
 
-        while (waitpid(pcb.pid, &status, 0) == -1) {
-            if (errno == EINTR) {
-                if (terminateRequested)
-                    return false;
+        while (nextTablePrint <= currentTime)
+            nextTablePrint += TABLE_INTERVAL;
+    }
 
+    if (currentTime >= nextDeadlockCheck)
+    {
+        while (detectDeadlock()) { }
+
+        currentTime = clockToNano();
+
+        while (nextDeadlockCheck <= currentTime)
+            nextDeadlockCheck += DEADLOCK_INTERVAL;
+    }
+}
+
+void killChildren()
+{
+    for (int i = 0; i < MAX_PCB; i++)
+    {
+        if (processTable[i].occupied && processTable[i].pid > 0)
+            kill(processTable[i].pid, SIGTERM);
+    }
+
+    for (int i = 0; i < MAX_PCB; i++)
+    {
+        if (!processTable[i].occupied)
+            continue;
+
+        pid_t pid = processTable[i].pid;
+
+        while (waitpid(pid, nullptr, 0) == -1)
+        {
+            if (errno == EINTR)
                 continue;
-            }
-
-            if (errno != ECHILD)
-                perror("waitpid");
 
             break;
         }
 
-        memset(&pcb, 0, sizeof(PCB));
-        totalFinished++;
-        return true;
+        memset(&processTable[i], 0, sizeof(PCB));
     }
 
-    if (incoming.status == IO_BLOCKED) {
-        pcb.blocked = 1;
-        addTime(IO_BLOCK_TIME, pcb.eventWaitSec, pcb.eventWaitNano);
-        totalIoBlocks++;
-        logMessage("OSS: Process %d used part of its quantum and is being put into the blocked queue\n", pcb.localPid);
-        return true;
-    }
-
-    if (incoming.status == QUANTUM_USED) {
-        if (queue < 2) {
-            pcb.queueLevel = queue + 1;
-            logMessage("OSS: Process %d used its full quantum. Demoting to q%d\n", pcb.localPid, pcb.queueLevel);
-        }
-        else 
-            logMessage("OSS: Process %d used its full quantum. Returning to q2\n", pcb.localPid);
-
-        readyQueues[pcb.queueLevel].push_back(index);
-    }
-
-    return true;
+    readyQueue.clear();
 }
 
-int main(int argc, char* argv[])
+void cleanup()
 {
-    double timeLimit = 2.5,
-        launchInterval = 0.0;
+    if (systemClock != nullptr)
+    {
+        shmdt(systemClock);
+        systemClock = nullptr;
+    }
 
+    if (shmId != -1)
+    {
+        shmctl(shmId, IPC_RMID, nullptr);
+        shmId = -1;
+    }
+
+    if (msgId != -1)
+    {
+        msgctl(msgId, IPC_RMID, nullptr);
+        msgId = -1;
+    }
+
+    if (logFile != nullptr)
+    {
+        fclose(logFile);
+        logFile = nullptr;
+    }
+}
+
+void printFinalReport()
+{
+    logMessage("============================================\n");
+    logMessage("             OSS FINAL REPORT\n");
+    logMessage("============================================\n");
+
+    logMessage("Total processes launched: %d\n", totalLaunched);
+    logMessage("Total processes finished: %d\n", totalFinished);
+    logMessage("Total resource requests: %d\n", totalRequests);
+    logMessage("Immediate resource grants: %d\n", immediateGrants);
+    logMessage("Deadlock detection runs: %d\n", deadlockChecks);
+    logMessage("Processes terminated to resolve deadlock: %d\n", deadlockTerminations);
+
+    double grantPercentage = 0.0;
+
+    if (totalRequests > 0)
+        grantPercentage = (static_cast<double>(immediateGrants) / totalRequests) * 100.0;
+
+    logMessage("Percentage of requests granted immediately: %.2f%%\n", grantPercentage);
+    logMessage("Percentage of requests not granted immediately: %.2f%%\n", totalRequests > 0 ? 100.0 - grantPercentage : 0.0);
+    logMessage("Final simulated time: %u:%u\n", systemClock->seconds, systemClock->nanoseconds);
+
+    logMessage("============================================\n");
+}
+
+bool parseArguments(int argc, char* argv[])
+{
     string logFileName = "oss.log";
 
     int option;
 
-    while ((option = getopt(argc, argv, "hn:s:t:i:f:")) != -1) {
+    while ((option = getopt(argc, argv, "hn:s:t:i:f:")) != -1)
+    {
+
         switch (option) {
+
             case 'h':
-                cout << "Usage: ./oss [-h] [-n proc] [-s simul] [-t timelimit] [-i interval] [-f logfile]\n";
-                return 0;
+                cout << "Usage: ./oss [-h] [-n proc] [-s simul] [-t timeLimit] [-i launchInterval] [-f logfile]\n";
+                cout << "-n Maximum number of processes\n";
+                cout << "-s Maximum simultaneous processes\n";
+                cout << "-t Maximum worker lifetime in seconds\n";
+                cout << "-i Process launch interval in seconds\n";
+                cout << "-f Log file name\n";
+
+                return false;
 
             case 'n':
                 maxProcesses = atoi(optarg);
@@ -579,125 +940,176 @@ int main(int argc, char* argv[])
 
             default:
                 cerr << "Invalid arguments. Use ./oss -h\n";
-                return 1;
+                return false;
         }
     }
 
-    if (maxProcesses <= 0 || simultaneousProcesses <= 0 || timeLimit < 0 || launchInterval < 0) {
+    if (maxProcesses <= 0 || simultaneousProcesses <= 0 || timeLimit < 0 || launchInterval < 0)
+    {
         cerr << "Invalid argument values.\n";
-        return 1;
+        return false;
     }
 
     if (simultaneousProcesses > MAX_PCB)
         simultaneousProcesses = MAX_PCB;
 
-    maxLifetimeNano = static_cast<long long>(timeLimit * BILLION);
-    launchIntervalNano = static_cast<long long>(launchInterval * BILLION);
-    randomEngine.seed(static_cast<unsigned long long>(time(nullptr)) ^ static_cast<unsigned long long>(getpid()));
+    if (timeLimit > 0)
+        maxLifetimeNano = static_cast<long long>(timeLimit * BILLION);
+    else
+        maxLifetimeNano = 0;
 
+    launchIntervalNano = static_cast<long long>(launchInterval * BILLION);
     logFile = fopen(logFileName.c_str(), "w");
 
-    if (!logFile) {
+    if (logFile == nullptr)
+    {
         perror("fopen");
-        return 1;
+        return false;
     }
 
-    memset(processTable, 0, sizeof(processTable));
+    return true;
+}
 
-    struct sigaction sa {};
+bool initializeSignals()
+{
+    struct sigaction sa{};
 
     sa.sa_handler = signalHandler;
+
     sigemptyset(&sa.sa_mask);
+
     sa.sa_flags = 0;
 
-    if (sigaction(SIGINT, &sa, nullptr) == -1 || sigaction(SIGALRM, &sa, nullptr) == -1) {
-        perror("sigaction");
-        cleanup();
-        return 1;
-    }
+    if (sigaction(SIGINT, &sa, nullptr) == -1)
+        return false;
 
-    alarm(3);
+    if (sigaction(SIGTERM, &sa, nullptr) == -1)
+        return false;
+
+    if (sigaction(SIGALRM, &sa, nullptr) == -1)
+        return false;
+
+    alarm(5);
+
+    return true;
+}
+
+bool initializeIPC()
+{
     msgId = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
 
-    if (msgId == -1) {
+    if (msgId == -1)
+    {
         perror("msgget");
-        cleanup();
-        return 1;
+        return false;
     }
 
     shmId = shmget(IPC_PRIVATE, sizeof(SharedClock), IPC_CREAT | 0600);
 
-    if (shmId == -1) {
+    if (shmId == -1)
+    {
         perror("shmget");
-        cleanup();
-        return 1;
+        return false;
     }
 
     systemClock = static_cast<SharedClock*>(shmat(shmId, nullptr, 0));
 
-    if (systemClock == reinterpret_cast<SharedClock*>(-1)) {
+    if (systemClock == reinterpret_cast<SharedClock*>(-1))
+    {
         perror("shmat");
         systemClock = nullptr;
-        cleanup();
-        return 1;
+        return false;
     }
 
     systemClock->seconds = 0;
     systemClock->nanoseconds = 0;
 
-    string msgString = to_string(msgId),
-        shmString = to_string(shmId);
+    string messageString = to_string(msgId),
+        sharedString = to_string(shmId);
 
-    setenv("OSS_MSG_ID", msgString.c_str(), 1);
-    setenv("OSS_SHM_ID", shmString.c_str(), 1);
+    setenv("OSS_MSG_ID", messageString.c_str(), 1);
+    setenv("OSS_SHM_ID", sharedString.c_str(), 1);
+
+    return true;
+}
+
+int main(int argc, char* argv[])
+{
+    if (!parseArguments(argc, argv))
+    {
+        cleanup();
+        return 0;
+    }
+
+    randomEngine.seed(static_cast<unsigned long long>(time(nullptr)) ^ static_cast<unsigned long long>(getpid()));
+
+    memset(processTable, 0, sizeof(processTable));
+
+    initializeResources();
+
+    if (!initializeSignals())
+    {
+        perror("sigaction");
+        cleanup();
+        return 1;
+    }
+
+    if (!initializeIPC())
+    {
+        cleanup();
+        return 1;
+    }
+
+    logMessage("\nOSS starting.\n");
+    logMessage("OSS PID: %d\n", static_cast<int>(getpid()));
+    logMessage("Maximum processes: %d\n", maxProcesses);
+    logMessage("Maximum simultaneous processes: %d\n", simultaneousProcesses);
+    logMessage("Maximum worker lifetime: %.2f seconds\n", timeLimit);
+    logMessage("Launch interval: %.2f seconds\n", launchInterval);
+    logMessage("Resource classes: %d\n", RESOURCE_TYPES);
+    logMessage("Instances per resource: %d\n\n", RESOURCE_INSTANCES);
 
     nextLaunchTime = 0;
-    cout << "OSS starting, PID: " << getpid() << " PPID: " << getppid() << '\n';
-    cout << "Called with:\n" << "-n " << maxProcesses << '\n' << "-s " << simultaneousProcesses << '\n' << "-t " << timeLimit << '\n' << "-i " << launchInterval << '\n';
 
-    logMessage("OSS: Starting MLFQ scheduler.\n");
+    while (!terminateRequested && (totalLaunched < maxProcesses || activeChildren() > 0))
+    {
+        long long currentTime;
 
-    while (!terminateRequested && (totalLaunched < maxProcesses || activeChildren() > 0)) {
+        if (stopLaunching)
+            maxProcesses = totalLaunched;
 
-        long long currentTime = clockToNano();
-        checkBlockedProcesses();
+        grantWaitingProcesses();
         currentTime = clockToNano();
 
-        while (totalLaunched < maxProcesses && activeChildren() < simultaneousProcesses && currentTime >= nextLaunchTime) {
-            if (!launchWorker())
-                break;
-
-            nextLaunchTime = clockToNano() + launchIntervalNano;
-            currentTime = clockToNano();
-
-            if (launchIntervalNano > 0)
-                break;
+        if (!stopLaunching && totalLaunched < maxProcesses && activeChildren() < simultaneousProcesses && activeChildren() < MAX_PCB && currentTime >= nextLaunchTime)
+        {
+            if (launchWorker())
+                nextLaunchTime = clockToNano() + launchIntervalNano;
         }
 
-        updateProcessTableTiming();
-        printQueues();
+        updatePeriodicEvents();
+
+        if (terminateRequested)
+            break;
 
         int selected = selectProcess();
 
-        if (selected != -1) {
-            if (!dispatchProcess(selected) && !terminateRequested) {
-                logMessage("OSS: Communication error.\n");
-                break;
-            }
-        }
-        else 
-            advanceIdleClock();
+        if (selected != -1)
+            dispatchProcess(selected);
 
-        updateProcessTableTiming();
+        advanceClock(CLOCK_INCREMENT);
+
+        updatePeriodicEvents();
     }
 
-    if (terminateRequested) {
-        logMessage("OSS: Termination signal received.\n");
+    if (terminateRequested)
+    {
+        logMessage("\nOSS: Termination signal received. Cleaning up workers.\n");
         killChildren();
-        totalFinished = totalLaunched;
     }
 
     printFinalReport();
     cleanup();
+
     return 0;
 }
