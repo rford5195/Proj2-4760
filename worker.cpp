@@ -1,4 +1,3 @@
-
 #include <iostream>
 #include <cstdlib>
 #include <cerrno>
@@ -12,29 +11,9 @@
 #include <random>
 #include <ctime>
 
+#include "resource.h"
+
 using namespace std;
-
-const long OSS_MESSAGE_TYPE = 1;
-const long long BILLION = 1000000000LL;
-
-enum {
-    TERMINATED = 0,
-    QUANTUM_USED = 1,
-    IO_BLOCKED = 2
-};
-
-struct SharedClock {
-    unsigned int seconds,
-        nanoseconds;
-};
-
-struct Message {
-    long mtype;
-    pid_t pid;
-    long long quantum,
-        used;
-    int status;
-};
 
 int shmId = -1,
     msgId = -1;
@@ -42,6 +21,8 @@ int shmId = -1,
 SharedClock* systemClock = nullptr;
 
 volatile sig_atomic_t terminateRequested = 0;
+
+int resourcesHeld[RESOURCE_TYPES] = {0};
 
 void signalHandler(int signalNumber)
 {
@@ -57,36 +38,124 @@ void cleanup()
     }
 }
 
+long long clockToNano()
+{
+    return static_cast<long long>(systemClock->seconds) * BILLION + systemClock->nanoseconds;
+}
+
+void sendAction(int action)
+{
+    Message outgoing{};
+
+    outgoing.mtype = OSS_MESSAGE_TYPE;
+    outgoing.pid = getpid();
+    outgoing.command = 0;
+    outgoing.resourceAction = action;
+
+    while (msgsnd(msgId, &outgoing, sizeof(Message) - sizeof(long), 0) == -1) {
+
+        if (errno == EINTR) {
+            if (terminateRequested)
+                return;
+            continue;
+        }
+
+        if (errno == EIDRM || errno == EINVAL) {
+            terminateRequested = 1;
+            return;
+        }
+
+        perror("worker msgsnd");
+        terminateRequested = 1;
+        return;
+    }
+}
+
+bool receiveMessage(Message& incoming)
+{
+    while (msgrcv(msgId, &incoming, sizeof(Message) - sizeof(long), static_cast<long>(getpid()), 0) == -1) {
+
+        if (errno == EINTR) {
+            if (terminateRequested)
+                return false;
+            continue;
+        }
+
+        if (errno == EIDRM || errno == EINVAL) {
+            terminateRequested = 1;
+            return false;
+        }
+
+        perror("worker msgrcv");
+        terminateRequested = 1;
+        return false;
+    }
+
+    return true;
+}
+
+int chooseResourceToRequest(mt19937_64& engine)
+{
+    int candidates[RESOURCE_TYPES];
+    int count = 0;
+
+    for (int i = 0; i < RESOURCE_TYPES; i++) {
+        if (resourcesHeld[i] < RESOURCE_INSTANCES)
+            candidates[count++] = i;
+    }
+
+    if (count == 0)
+        return -1;
+
+    uniform_int_distribution<int> distribution(0, count - 1);
+
+    return candidates[distribution(engine)];
+}
+
+int chooseResourceToRelease(mt19937_64& engine)
+{
+    int candidates[RESOURCE_TYPES],
+        count = 0;
+
+    for (int i = 0; i < RESOURCE_TYPES; i++) {
+        if (resourcesHeld[i] > 0)
+            candidates[count++] = i;
+    }
+
+    if (count == 0)
+        return -1;
+
+    uniform_int_distribution<int> distribution(0, count - 1);
+
+    return candidates[distribution(engine)];
+}
+
 int main(int argc, char* argv[])
 {
-    if (argc != 2) {
-        cerr << "Usage: ./worker totalBurstNanoseconds\n";
+    if (argc != 4) {
+        cerr << "Usage: ./worker lifetime startSeconds startNano\n";
         return 1;
     }
 
-    long long remainingTime = atoll(argv[1]);
+    long long lifetime = atoll(argv[1]);
 
-    if (remainingTime < 0) {
-        cerr << "Invalid CPU burst.\n";
-        return 1;
-    }
+    unsigned int startSeconds = static_cast<unsigned int>(atoi(argv[2])),
+        startNano = static_cast<unsigned int>(atoi(argv[3]));
 
-    struct sigaction sa {};
+    struct sigaction sa{};
 
     sa.sa_handler = signalHandler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
 
-    if (sigaction(SIGTERM, &sa, nullptr) == -1 || sigaction(SIGINT, &sa, nullptr) == -1) {
-        perror("sigaction");
-        return 1;
-    }
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
 
     const char* shmEnvironment = getenv("OSS_SHM_ID");
     const char* msgEnvironment = getenv("OSS_MSG_ID");
 
     if (!shmEnvironment || !msgEnvironment) {
-        cerr << "OSS shared memory or message queue ID missing.\n";
+        cerr << "Missing IPC environment variables.\n";
         return 1;
     }
 
@@ -96,97 +165,95 @@ int main(int argc, char* argv[])
     systemClock = static_cast<SharedClock*>(shmat(shmId, nullptr, 0));
 
     if (systemClock == reinterpret_cast<SharedClock*>(-1)) {
-        perror("shmat");
+        perror("worker shmat");
         systemClock = nullptr;
         return 1;
     }
 
-    mt19937_64 randomEngine(static_cast<unsigned long long>(getpid()) ^ static_cast<unsigned long long>(time(nullptr)));
+    mt19937_64 engine(static_cast<unsigned long long>(getpid()) ^ static_cast<unsigned long long>(time(nullptr)));
 
-    uniform_int_distribution<int> ioChance(1, 100);
+    uniform_int_distribution<int> actionChance(1, 100);
 
-    cout << "WORKER PID:" << getpid() << " PPID:" << getppid() << " Starting CPU burst: " << remainingTime << " nanoseconds\n";
+    cout << "WORKER " << getpid() << " starting. Lifetime: " << lifetime << " ns\n";
 
     while (!terminateRequested) {
-        Message incoming {};
 
-        while (msgrcv(msgId, &incoming, sizeof(Message) - sizeof(long), static_cast<long>(getpid()), 0) == -1) {
-            if (errno == EINTR) {
-                if (terminateRequested)
-                    break;
+        Message incoming{};
 
-                continue;
-            }
+        if (!receiveMessage(incoming))
+            break;
 
-            if (errno == EIDRM || errno == EINVAL) {
-                terminateRequested = 1;
-                break;
-            }
-
-            perror("worker msgrcv");
-            terminateRequested = 1;
+        if (incoming.command == TERMINATE) {
+            cout << "WORKER " << getpid() << " received termination.\n";
             break;
         }
 
-        if (terminateRequested)
-            break;
+        if (incoming.command == GRANT) {
 
-        long long quantum = incoming.quantum;
+            int resource = incoming.resourceAction;
 
-        if (quantum <= 0)
+            if (resource >= 0 && resource < RESOURCE_TYPES) {
+                resourcesHeld[resource]++;
+                cout << "WORKER " << getpid() << " received R" << resource << ". Total held: " << resourcesHeld[resource] << "\n";
+            }
+
+            continue;
+        }
+
+        if (incoming.command != DISPATCH)
             continue;
 
-        Message outgoing {};
+        long long currentTime = clockToNano(),
+            startTime = static_cast<long long>(startSeconds) * BILLION + startNano;
 
-        outgoing.mtype = OSS_MESSAGE_TYPE;
-        outgoing.pid = getpid();
-
-        if (remainingTime <= quantum) {
-            outgoing.used = remainingTime;
-            outgoing.status = TERMINATED;
-            cout << "WORKER PID:" << getpid() << " Terminating after using " << outgoing.used << " nanoseconds\n";
-            remainingTime = 0;
+        if (currentTime - startTime >= lifetime) {
+            cout << "WORKER " << getpid() << " lifetime expired.\n";
+            sendAction(0);
+            break;
         }
-        else {
-            int chance = ioChance(randomEngine);
 
-            if (chance <= 20) {
-                uniform_int_distribution<long long> ioTime(1, quantum - 1);
-                outgoing.used = ioTime(randomEngine);
-                outgoing.status = IO_BLOCKED;
+        int chance = actionChance(engine),
+            action = 0;
 
-                cout << "WORKER PID:" << getpid() << " Becoming blocked after using " << outgoing.used << " nanoseconds\n";
+        if (chance <= 70) {
+            int resource = chooseResourceToRequest(engine);
+
+            if (resource != -1) {
+                action = resource + 1;
+
+                cout << "WORKER " << getpid() << " requesting R" << resource << "\n";
             }
+        }
+
+        if (action == 0 && chance > 70) {
+            int resource = chooseResourceToRelease(engine);
+
+            if (resource != -1) {
+                action = -(resource + 1);
+                resourcesHeld[resource]--;
+                cout << "WORKER " << getpid() << " releasing R" << resource << "\n";
+            }
+        }
+
+        if (action == 0) {
+            int resource = chooseResourceToRequest(engine);
+
+            if (resource != -1)
+                action = resource + 1;
             else {
-                outgoing.used = quantum;
-                outgoing.status = QUANTUM_USED;
-                cout << "WORKER PID:" << getpid() << " Used full quantum of " << quantum << " nanoseconds\n";
+                resource = chooseResourceToRelease(engine);
+
+                if (resource != -1) {
+                    action = -(resource + 1);
+                    resourcesHeld[resource]--;
+                }
             }
         }
 
-        remainingTime -= outgoing.used;
+        if (action == 0)
+            continue;
 
-        while (msgsnd(msgId, &outgoing, sizeof(Message) - sizeof(long), 0) == -1) {
-
-            if (errno == EINTR) {
-                if (terminateRequested)
-                    break;
-
-                continue;
-            }
-
-            if (errno == EIDRM || errno == EINVAL) {
-                terminateRequested = 1;
-                break;
-            }
-
-            perror("worker msgsnd");
-            terminateRequested = 1;
-            break;
-        }
-
-        if (outgoing.status == TERMINATED)
-            break;
+        sendAction(action);
     }
 
     cleanup();
