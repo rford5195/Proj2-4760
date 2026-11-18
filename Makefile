@@ -1,18 +1,15 @@
 CXX = g++
-
 CXXFLAGS = -Wall -Wextra -std=c++17 -g
 
-TARGETS = oss worker
+all: oss worker
 
-all: $(TARGETS)
-
-oss: oss.cpp
+oss: oss.cpp resource.h
 	$(CXX) $(CXXFLAGS) -o oss oss.cpp
 
-worker: worker.cpp
+worker: worker.cpp resource.h
 	$(CXX) $(CXXFLAGS) -o worker worker.cpp
 
 clean:
-	rm -f $(TARGETS) *.o
+	rm -f oss worker *.o oss.log
 
 .PHONY: all clean
