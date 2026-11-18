@@ -4,7 +4,7 @@ Environment: Visual Studio, Linux, git
 How to compile the project:
 Type ’make’
 Example of how to run the project:
-./oss -n 10 -s 5 -t 2.5 -i 0.2 -f oss.log
+./oss -n 20 -s 5 -t 2 -i 0.1 -f oss.log
 Generative AI Used: chatgpt
 Prompt:
   How would you start this project
